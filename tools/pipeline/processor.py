@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -25,7 +25,9 @@ LOGGER = logging.getLogger(__name__)
 def _timestamp_run_id(suffix: str | None = None) -> str:
     base = str(int(time.time()))
     if suffix:
-        return f"{base}_{suffix}"
+        clean = _slugify(suffix.strip())
+        if clean:
+            return f"{base}_{clean}"
     return base
 
 
@@ -50,6 +52,9 @@ class ProcessingConfig:
         self.processing_root.mkdir(parents=True, exist_ok=True)
         self.processed_root = self.processed_root.expanduser().resolve()
         self.processed_root.mkdir(parents=True, exist_ok=True)
+        if self.run_suffix:
+            cleaned_suffix = _slugify(self.run_suffix.strip())
+            self.run_suffix = cleaned_suffix or None
         if not self.run_id:
             self.run_id = _timestamp_run_id(self.run_suffix)
 
@@ -281,6 +286,18 @@ class EventProcessor:
 
         frame_idx = 0
         annotations_generated = 0
+        fade_schedule: List[Tuple[float, float]] = [
+            (0.75, 0.75),
+            (0.75, 0.75),
+            (0.50, 0.50),
+            (0.50, 0.50),
+            (0.50, 0.50),
+            (0.25, 0.25),
+            (0.25, 0.25),
+            (0.25, 0.25),
+            (0.10, 0.10),
+        ]
+        persisted_boxes: Dict[str, Dict[str, Any]] = {}
         try:
             while True:
                 ret, frame = cap.read()
@@ -288,18 +305,35 @@ class EventProcessor:
                     break
 
                 time_sec = frame_idx / fps if fps else 0.0
-                frame_data = analytics.get_frame(frame_idx)
+                frame_data = analytics.frame_for_time(time_sec, fps=fps)
+                if frame_data:
+                    if frame_data.time_sec is not None:
+                        delta = abs(frame_data.time_sec - time_sec)
+                        tolerance = max(1.0 / max(fps, 1.0), 0.05)
+                    else:
+                        delta = abs(frame_data.frame_num - frame_idx) / max(fps, 1.0)
+                        tolerance = max(1.0 / max(fps, 1.0), 0.05)
+                    if delta > tolerance:
+                        frame_data = None
 
                 boxes_output: List[Mapping[str, object]] = []
                 active_tracks: List[str] = []
+                current_ids: set[str] = set()
 
                 if frame_data and frame_data.objects:
                     annotations_generated += len(frame_data.objects)
                     for box in frame_data.objects:
                         color = resolve_track_color(box.label)
                         bbox = self._clamp_bbox(box, width, height)
-                        text_lines = self._format_bbox_annotation(box, frame_idx)
+                        text_lines = self._format_bbox_annotation(box, bbox)
                         draw_bbox_annotation(frame, bbox, text_lines, self.style, font_scale, color)
+                        current_ids.add(str(box.object_id))
+                        persisted_boxes[str(box.object_id)] = {
+                            "bbox": bbox,
+                            "lines": text_lines,
+                            "color": color,
+                            "fade_index": 0,
+                        }
                         boxes_output.append(
                             {
                                 "track_id": box.object_id,
@@ -330,8 +364,8 @@ class EventProcessor:
                     end_point = points[-1]
                     active_point = points[offset]
                     color = resolve_track_color(track.label)
-                    start_label = f"start {track.start_sec:.2f}s ({start_point[0]}, {start_point[1]})"
-                    end_label = f"end {track.end_sec:.2f}s ({end_point[0]}, {end_point[1]})"
+                    start_label = f"start: {track.start_sec:.2f}s"
+                    end_label = f"end: {track.end_sec:.2f}s"
                     draw_track_annotations(
                         frame,
                         track_id=track.track_id,
@@ -346,6 +380,29 @@ class EventProcessor:
                         active_point=active_point,
                     )
                     active_tracks.append(track.track_id)
+
+                for object_id, entry in list(persisted_boxes.items()):
+                    if object_id in current_ids:
+                        entry["fade_index"] = 0
+                        persisted_boxes[object_id] = entry
+                        continue
+                    idx = entry.get("fade_index", 0)
+                    if idx >= len(fade_schedule):
+                        del persisted_boxes[object_id]
+                        continue
+                    stroke_scale, background_scale = fade_schedule[idx]
+                    draw_bbox_annotation(
+                        frame,
+                        entry["bbox"],
+                        entry["lines"],
+                        self.style,
+                        font_scale,
+                        entry["color"],
+                        stroke_alpha=stroke_scale,
+                        background_alpha_scale=background_scale,
+                    )
+                    entry["fade_index"] = idx + 1
+                    persisted_boxes[object_id] = entry
 
                 if boxes_output or active_tracks:
                     frame_outputs.append(
@@ -373,17 +430,38 @@ class EventProcessor:
         return frame_outputs, output_path
 
     def _clamp_bbox(self, box: BoundingBox, width: int, height: int) -> Tuple[int, int, int, int]:
-        x = int(max(0, min(box.x, width - 1)))
-        y = int(max(0, min(box.y, height - 1)))
-        w = int(max(1, min(box.width, width - x)))
-        h = int(max(1, min(box.height, height - y)))
-        return x, y, w, h
+        x0 = int(round(box.x))
+        y0 = int(round(box.y))
+        w = max(1, int(round(box.width)))
+        h = max(1, int(round(box.height)))
 
-    def _format_bbox_annotation(self, box: BoundingBox, frame_idx: int) -> List[str]:
+        x1 = x0 + w
+        y1 = y0 + h
+
+        if x0 < 0:
+            x0 = 0
+        if y0 < 0:
+            y0 = 0
+        if x1 > width:
+            x0 = max(0, width - w)
+            x1 = min(width, x0 + w)
+        if y1 > height:
+            y0 = max(0, height - h)
+            y1 = min(height, y0 + h)
+
+        x0 = min(max(x0, 0), max(width - 1, 0))
+        y0 = min(max(y0, 0), max(height - 1, 0))
+        x1 = min(max(x1, x0 + 1), width)
+        y1 = min(max(y1, y0 + 1), height)
+
+        return x0, y0, x1 - x0, y1 - y0
+
+    def _format_bbox_annotation(self, box: BoundingBox, clamped_bbox: Tuple[int, int, int, int]) -> List[str]:
+        clamp_x, clamp_y, clamp_w, clamp_h = clamped_bbox
+        label = box.label.title()
         return [
-            f"{box.label} {box.confidence:.2f}",
-            f"frame={frame_idx} id={box.object_id} life={box.life}",
-            f"({int(box.x)},{int(box.y)}) {int(box.width)}x{int(box.height)}",
+            f"{label} #{box.object_id}|{box.life} ({box.confidence:.2f})",
+            f"({clamp_x},{clamp_y}) {clamp_h}x{clamp_w}",
         ]
 
     # Thumbnail annotation -----------------------------------------------
@@ -422,7 +500,7 @@ class EventProcessor:
             for box in frame_data.objects:
                 color = resolve_track_color(box.label)
                 bbox = self._clamp_bbox(box, width, height)
-                text_lines = self._format_bbox_annotation(box, frame_data.frame_num)
+                text_lines = self._format_bbox_annotation(box, bbox)
                 draw_bbox_annotation(resized, bbox, text_lines, self.style, font_scale, color)
                 boxes_output.append(
                     {

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
-from pipeline.events import EventBundle, discover_events
-from pipeline.logging_utils import configure_logging
-from pipeline.processor import EventProcessor, ProcessingConfig
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from tools.pipeline.events import EventBundle, discover_events
+from tools.pipeline.logging_utils import configure_logging
+from tools.pipeline.processor import EventProcessor, ProcessingConfig
 
 
 def _select_bundle(event_path: Path) -> EventBundle:
@@ -28,7 +32,7 @@ def _select_bundle(event_path: Path) -> EventBundle:
     raise RuntimeError(f"Unable to locate event files for {event_path}")
 
 
-def process_video_event(event_path: Path, output_dir: Path) -> None:
+def process_video_event(event_path: Path, output_dir: Path, run_suffix: str | None) -> None:
     """Run the per-event processing workflow."""
     configure_logging()
     bundle = _select_bundle(event_path)
@@ -38,6 +42,7 @@ def process_video_event(event_path: Path, output_dir: Path) -> None:
         queue_dir=event_path.parent,
         processing_root=Path("processing"),
         processed_root=output_dir,
+        run_suffix=run_suffix,
     )
     processor = EventProcessor(config)
     processor.process_bundle(bundle)
@@ -52,12 +57,18 @@ def parse_args() -> argparse.Namespace:
         default=Path("processed"),
         help="Directory where outputs should be saved (default: processed)",
     )
+    parser.add_argument(
+        "--run-suffix",
+        type=str,
+        default=None,
+        help="Optional suffix appended to the generated run id",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    process_video_event(args.event, args.output)
+    process_video_event(args.event, args.output, args.run_suffix)
 
 
 if __name__ == "__main__":

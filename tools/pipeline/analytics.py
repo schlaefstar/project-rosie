@@ -89,6 +89,7 @@ class AnalyticsData:
     frames: Dict[int, FrameDetections]
     tracks: Dict[str, TrackSegment]
     raw: Mapping[str, object]
+    frames_sorted_by_time: List[FrameDetections] = field(default_factory=list, repr=False)
 
     def get_frame(self, frame_idx: int) -> FrameDetections | None:
         return self.frames.get(frame_idx)
@@ -110,6 +111,19 @@ class AnalyticsData:
             "height": self.height,
             "duration_sec": self.duration_sec,
         }
+
+    def frame_for_time(self, time_sec: float, fps: float | None = None) -> FrameDetections | None:
+        if not self.frames_sorted_by_time:
+            return None
+
+        def frame_time(frame: FrameDetections) -> float:
+            if frame.time_sec is not None:
+                return frame.time_sec
+            if fps and fps > 0:
+                return frame.frame_num / fps
+            return float(frame.frame_num)
+
+        return min(self.frames_sorted_by_time, key=lambda frame: abs(frame_time(frame) - time_sec))
 
 
 def _open_analytics_file(path: Path):
@@ -178,6 +192,11 @@ def load_analytics(path: Path) -> AnalyticsData:
 
     normalized = bool(data.get("normalized", False))
 
+    frames_sorted_by_time = sorted(
+        frames.values(),
+        key=lambda frame: frame.time_sec if frame.time_sec is not None else frame.frame_num,
+    )
+
     return AnalyticsData(
         width=int(width) if width is not None else None,
         height=int(height) if height is not None else None,
@@ -186,6 +205,7 @@ def load_analytics(path: Path) -> AnalyticsData:
         frames=frames,
         tracks=tracks,
         raw=data,
+        frames_sorted_by_time=frames_sorted_by_time,
     )
 
 

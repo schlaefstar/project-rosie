@@ -6,12 +6,16 @@ import argparse
 import json
 import logging
 import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict
 
-from pipeline.events import parse_event_key
-from pipeline.logging_utils import configure_logging
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from tools.pipeline.events import parse_event_key
+from tools.pipeline.logging_utils import configure_logging
 
 LOGGER = logging.getLogger(__name__)
 

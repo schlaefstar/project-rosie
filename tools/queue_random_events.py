@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
-from pipeline.logging_utils import configure_logging
-from pipeline.queue import QueueManager
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from tools.pipeline.logging_utils import configure_logging
+from tools.pipeline.queue import QueueManager
 
 
 def queue_random_events(source_dir: Path, queue_dir: Path, sample_size: int, allow_duplicates: bool) -> int:
