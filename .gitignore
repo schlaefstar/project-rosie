@@ -1,0 +1,36 @@
+# Video and image media
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Event data and logs
+*.json
+*.json.gz
+*.log
+
+# Excluded directories
+/raw_videos/
+/to_process/
+/processing/
+/processed/
+/by_device_type/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+
+# macOS
+.DS_Store
