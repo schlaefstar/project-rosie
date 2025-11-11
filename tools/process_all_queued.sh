@@ -7,4 +7,4 @@ set -euo pipefail
 QUEUE_DIR=${1:-"to_process"}
 PROCESSED_DIR=${2:-"processed"}
 
-python tools/process_pipeline.py "$QUEUE_DIR" "$PROCESSED_DIR"
+python tools/process_pipeline.py --queue "$QUEUE_DIR" --processed "$PROCESSED_DIR" --all
