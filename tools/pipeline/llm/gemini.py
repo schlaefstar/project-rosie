@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Mapping, MutableMapping, Sequence
@@ -22,26 +23,19 @@ from .usage import UsageLedger, UsageRecord
 
 LOGGER = logging.getLogger(__name__)
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_PROMPT_PATH = _PROJECT_ROOT / "config" / "llm_prompts" / "gemini_caption_prompt.txt"
+
+
+def _default_schema() -> str:
+    return (
+        '{"summary": str, "classifications": [{"label": str, "confidence": float, "rationale": str}], '
+        '"token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}'
+    )
+
 
 def _read_binary(path: Path) -> bytes:
     return path.read_bytes()
-
-
-def _default_prompt(event: MediaEvent) -> str:
-    context_parts: List[str] = [
-        "You are Rosie, a security analyst summarizing short residential camera events.",
-        "Describe what happens in at most three sentences.",
-        "Be specific about people, packages, vehicles, and notable motion.",
-        "If the visuals are unclear, state the uncertainty explicitly.",
-        "Return ONLY valid JSON matching:\n"
-        '{"summary": str, "classifications": [{"label": str, "confidence": float, "rationale": str}], '
-        '"token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}.',
-    ]
-    if event.detector_summary:
-        context_parts.append(f"Detector context: {event.detector_summary}")
-    if event.metadata:
-        context_parts.append(f"Metadata: {json.dumps(event.metadata, default=str)[:1000]}")
-    return "\n".join(context_parts)
 
 
 @dataclass
@@ -54,7 +48,8 @@ class GeminiProvider(LLMProvider):
     max_output_tokens: int | None = None
     pricing: PricingTable | None = None
     ledger: UsageLedger | None = None
-    prompt_builder: Callable[[MediaEvent], str] = _default_prompt
+    prompt_template_path: Path | None = None
+    prompt_builder: Callable[[MediaEvent], str] | None = None
     read_binary: Callable[[Path], bytes] = _read_binary
     timeout: float | None = None
 
@@ -70,6 +65,14 @@ class GeminiProvider(LLMProvider):
             generation_config["max_output_tokens"] = self.max_output_tokens
         self._generation_config = dict(generation_config)
         self._model = genai.GenerativeModel(self.model_name, generation_config=generation_config)
+        self._prompt_template = self._load_prompt_template()
+        if self.prompt_builder is None:
+            template = self._prompt_template
+
+            def _builder(event: MediaEvent, template: str = template) -> str:
+                return _render_prompt_template(template, event)
+
+            self.prompt_builder = _builder
 
     @property
     def provider_name(self) -> str:
@@ -80,7 +83,15 @@ class GeminiProvider(LLMProvider):
         return True
 
     def caption_event(self, event: MediaEvent) -> LLMResult:
+        if not self.prompt_builder:
+            raise LLMError("Prompt builder is not configured for GeminiProvider.")
         prompt = self.prompt_builder(event)
+        LOGGER.debug(
+            "Gemini prompt for event %s (model=%s): %s",
+            event.event_id,
+            self.model_name,
+            prompt,
+        )
         request_parts = [{"text": prompt}]
         media_parts = list(self._media_inputs(event))
         if not media_parts:
@@ -193,6 +204,38 @@ class GeminiProvider(LLMProvider):
             metadata=metadata,
         )
 
+    def _load_prompt_template(self) -> str:
+        candidate_paths: List[Path] = []
+        if self.prompt_template_path:
+            candidate_paths.append(Path(self.prompt_template_path).expanduser().resolve())
+        env_path = os.environ.get("ROSIE_LLM_PROMPT_PATH")
+        if env_path:
+            candidate_paths.append(Path(env_path).expanduser().resolve())
+        candidate_paths.append(_DEFAULT_PROMPT_PATH)
+
+        for path in candidate_paths:
+            try:
+                if path.exists():
+                    return path.read_text(encoding="utf-8")
+            except Exception as exc:  # pragma: no cover - configuration issue
+                LOGGER.warning("Failed to load prompt template from %s: %s", path, exc)
+
+        LOGGER.warning("Using fallback Gemini prompt template.")
+        return (
+            "You are Rosie, a security analyst summarizing short residential camera events.\n"
+            "Describe what happens in at most three sentences.\n"
+            "Be specific about people, packages, vehicles, and notable motion.\n"
+            "If the visuals are unclear, call out the uncertainty explicitly.\n"
+            "Return ONLY valid JSON matching:\n"
+            "[[SCHEMA_JSON]]\n"
+            "Context:\n"
+            "- Event ID: [[EVENT_ID]]\n"
+            "- Detector summary: [[DETECTOR_SUMMARY]]\n"
+            "- Frame samples: [[FRAME_LIST]]\n"
+            "- Metadata snippet: [[METADATA_SNIPPET]]\n"
+            "Do not include Markdown code fences or extra commentary."
+        )
+
     @staticmethod
     def _normalize_model_name(name: str) -> str:
         name = name.strip()
@@ -234,6 +277,30 @@ def _strip_code_fences(text: str) -> str:
     if lines and lines[-1].startswith("```"):
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+def _render_prompt_template(template: str, event: MediaEvent) -> str:
+    if event.metadata:
+        try:
+            metadata_snippet = json.dumps(event.metadata, default=str)[:1000]
+        except Exception:  # pragma: no cover
+            metadata_snippet = str(event.metadata)[:1000]
+    else:
+        metadata_snippet = "None provided."
+
+    detector_summary = event.detector_summary or "None provided."
+    frame_list = ", ".join(path.name for path in event.frame_paths) if event.frame_paths else "None provided."
+    replacements = {
+        "[[EVENT_ID]]": event.event_id or "unknown-event",
+        "[[DETECTOR_SUMMARY]]": detector_summary,
+        "[[FRAME_LIST]]": frame_list,
+        "[[METADATA_SNIPPET]]": metadata_snippet,
+        "[[SCHEMA_JSON]]": _default_schema(),
+    }
+    rendered = template
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    return rendered
 
 
 __all__ = ["GeminiProvider"]

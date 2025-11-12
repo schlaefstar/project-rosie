@@ -19,7 +19,8 @@ import numpy as np
 from .analytics import AnalyticsData, BoundingBox, FrameDetections, TrackSegment, load_analytics
 from .annotations import AnnotationStyle, draw_bbox_annotation, draw_track_annotations, resolve_track_color
 from .events import EventBundle, discover_events
-from .llm import GeminiProvider, LLMClient, LLMError, MediaEvent
+from .llm import GeminiProvider, LLMClient, LLMError, MediaEvent, PricingTable
+from .logging_utils import log_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -108,6 +109,8 @@ class ProcessedEventResult:
 class EventProcessor:
     """Executes per-event processing into annotated media and metadata."""
 
+    _EVENT_LOGGERS: Dict[str, logging.Logger] = {}
+
     def __init__(
         self,
         config: ProcessingConfig,
@@ -148,8 +151,15 @@ class EventProcessor:
             return None, None
 
         resolved_model = llm_model or os.environ.get("ROSIE_LLM_MODEL") or "models/gemini-2.0-flash"
+        pricing_path = os.environ.get("ROSIE_LLM_PRICING_PATH")
+        pricing = (
+            PricingTable.load_from_file(pricing_path)
+            if pricing_path
+            else PricingTable.load_default()
+        )
+
         try:
-            provider = GeminiProvider(api_key=api_key, model_name=resolved_model)
+            provider = GeminiProvider(api_key=api_key, model_name=resolved_model, pricing=pricing)
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Unable to initialize Gemini provider: %s. AI outputs disabled.", exc)
             return None, None
@@ -158,6 +168,29 @@ class EventProcessor:
         client.register(provider)
         LOGGER.info("LLM provider '%s' initialized with model '%s'.", provider.provider_name, provider.model_name)
         return client, provider.model_name
+
+    def _get_event_logger(self, event_id: str) -> logging.Logger:
+        logger_name = f"events.{event_id}"
+        logger = self._EVENT_LOGGERS.get(logger_name)
+        if logger:
+            return logger
+
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        path = self.config.processed_root / self.config.run_id / _slugify(event_id)
+        path.mkdir(parents=True, exist_ok=True)
+        log_file = path / f"{event_id}.log"
+        handler = logging.FileHandler(log_file)
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        handler.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        self._EVENT_LOGGERS[logger_name] = logger
+        return logger
 
     def _generate_ai_outputs(
         self,
@@ -184,13 +217,37 @@ class EventProcessor:
             detector_summary=detector_summary,
         )
 
+        event_logger = self._get_event_logger(event.event_id or bundle.key)
+        event_logger.info("LLM Input")
+        event_logger.info("  Model: %s", self._llm_model)
+        event_logger.info("  Video: %s", event.video_path)
+        event_logger.info("  Frames: %s", ", ".join(path.name for path in event.frame_paths) or "None")
+        event_logger.info("  Detector summary: %s", event.detector_summary or "None")
+        event_logger.info(
+            "  Metadata snippet: %s",
+            json.dumps(event.metadata, default=str, ensure_ascii=False)[:500] if event.metadata else "None",
+        )
+        prompt_preview = ""
         try:
+            prompt_builder = getattr(provider, "prompt_builder", None)
+            if prompt_builder:
+                prompt_preview = prompt_builder(event)
+        except Exception:  # pragma: no cover - defensive
+            prompt_preview = "[Unable to render prompt preview]"
+        if prompt_preview:
+            event_logger.info("  Prompt:\n%s", prompt_preview)
+
+        try:
+            start_time = time.time()
             result = self._llm_client.caption_event(self._llm_model, event)
+            elapsed = time.time() - start_time
         except LLMError as exc:
             LOGGER.warning("LLM captioning failed for event %s: %s", bundle.key, exc)
+            event_logger.error("LLM error: %s", exc)
             return {"error": str(exc)}
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.exception("Unexpected LLM failure for event %s", bundle.key)
+            event_logger.exception("Unexpected LLM failure for event %s", bundle.key)
             return {"error": str(exc)}
 
         output: Dict[str, object] = {
@@ -201,6 +258,29 @@ class EventProcessor:
         response_id = getattr(result.raw_response, "response_id", None)
         if response_id:
             output["response_id"] = response_id
+
+        event_logger.info("LLM Processing")
+        event_logger.info("  Duration: %.2fs", elapsed)
+        event_logger.info(
+            "  Tokens - prompt: %s, completion: %s, total: %s",
+            result.token_usage.prompt_tokens,
+            result.token_usage.completion_tokens,
+            result.token_usage.total_tokens,
+        )
+        event_logger.info("  Token metadata: %s", json.dumps(result.token_usage.metadata, ensure_ascii=False))
+        event_logger.info("  Cost (USD): %s", result.cost_usd)
+
+        event_logger.info("LLM Output")
+        event_logger.info("  Summary: %s", result.summary)
+        for classification in result.classifications:
+            event_logger.info(
+                "  Classification: %s (confidence=%.2f) - %s",
+                classification.label,
+                classification.confidence,
+                classification.rationale or "",
+            )
+        if response_id:
+            event_logger.info("  Response ID: %s", response_id)
         return output
 
     def _select_frame_samples(self, bundle: EventBundle) -> Sequence[Path]:
@@ -756,10 +836,10 @@ class EventProcessor:
 
         json_payload = {
             "identity_provenance": identity_provenance,
+            "outputs_ai": ai_outputs or {},
             "input": input_section,
             "processed": processed_section,
             "output_files": output_files,
-            "outputs_ai": ai_outputs or {},
         }
 
         return json_payload
