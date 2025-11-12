@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Protocol, Sequence, runtime_checkable
 
 
-@dataclass(slots=True)
+@dataclass
 class TokenUsage:
     """Token accounting returned by an LLM provider."""
 
@@ -28,7 +28,7 @@ class TokenUsage:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class Classification:
     """Structured label predicted by a model."""
 
@@ -43,7 +43,7 @@ class Classification:
         return data
 
 
-@dataclass(slots=True)
+@dataclass
 class LLMResult:
     """Standardized return payload from a provider call."""
 
@@ -62,7 +62,7 @@ class LLMResult:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class MediaEvent:
     """Media payload passed to a provider."""
 

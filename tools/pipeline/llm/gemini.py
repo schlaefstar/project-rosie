@@ -44,7 +44,7 @@ def _default_prompt(event: MediaEvent) -> str:
     return "\n".join(context_parts)
 
 
-@dataclass(slots=True)
+@dataclass
 class GeminiProvider(LLMProvider):
     """Adapter around the Gemini API."""
 
@@ -63,6 +63,7 @@ class GeminiProvider(LLMProvider):
             raise RuntimeError(
                 "google-generativeai is not installed. Install the package to use GeminiProvider."
             ) from _IMPORT_ERROR
+        self.model_name = self._normalize_model_name(self.model_name)
         genai.configure(api_key=self.api_key)
         generation_config: MutableMapping[str, Any] = {"temperature": self.temperature}
         if self.max_output_tokens:
@@ -165,6 +166,7 @@ class GeminiProvider(LLMProvider):
         if not candidate_text:
             raise LLMError("Gemini response did not include textual output.")
         candidate_text = candidate_text.strip()
+        candidate_text = _strip_code_fences(candidate_text)
         try:
             return json.loads(candidate_text)
         except json.JSONDecodeError as exc:
@@ -172,16 +174,34 @@ class GeminiProvider(LLMProvider):
             raise LLMError(f"Unable to parse JSON response: {exc}") from exc
 
     def _extract_usage(self, response: Any) -> TokenUsage:
-        usage_meta = getattr(response, "usage_metadata", None) or {}
-        prompt_tokens = int(usage_meta.get("prompt_token_count", 0))
-        completion_tokens = int(usage_meta.get("candidates_token_count", 0))
-        total_tokens = int(usage_meta.get("total_token_count", prompt_tokens + completion_tokens))
+        usage_meta = getattr(response, "usage_metadata", None)
+        prompt_tokens = int(_meta_value(usage_meta, "prompt_token_count") or 0)
+        completion_tokens = int(_meta_value(usage_meta, "candidates_token_count") or 0)
+        total_value = _meta_value(usage_meta, "total_token_count")
+        total_tokens = int(total_value) if total_value is not None else prompt_tokens + completion_tokens
+        metadata = {
+            "prompt_token_count": prompt_tokens,
+            "candidates_token_count": completion_tokens,
+            "total_token_count": total_tokens,
+        }
+        if isinstance(usage_meta, Mapping):
+            metadata.update({k: v for k, v in usage_meta.items() if k not in metadata})
         return TokenUsage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            metadata=dict(usage_meta),
+            metadata=metadata,
         )
+
+    @staticmethod
+    def _normalize_model_name(name: str) -> str:
+        name = name.strip()
+        if not name:
+            raise ValueError("model_name must be non-empty.")
+        lowered = name.lower()
+        if not lowered.startswith("models/"):
+            return f"models/{name}"
+        return name
 
 
 def _guess_image_mime(path: Path) -> str:
@@ -193,6 +213,27 @@ def _guess_image_mime(path: Path) -> str:
     if suffix == ".webp":
         return "image/webp"
     return "application/octet-stream"
+
+
+def _meta_value(meta: Any, key: str) -> Any:
+    if meta is None:
+        return None
+    if isinstance(meta, Mapping):
+        return meta.get(key)
+    return getattr(meta, key, None)
+
+
+def _strip_code_fences(text: str) -> str:
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[-1].startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
 
 __all__ = ["GeminiProvider"]

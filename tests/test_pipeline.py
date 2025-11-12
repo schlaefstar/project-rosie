@@ -214,12 +214,15 @@ class TestReportGeneration(unittest.TestCase):
             thumbnail_outputs=[thumb_output],
         )
 
-        self.assertEqual(report["event_id"], "320")
-        self.assertEqual(report["run"]["run_id"], "test_run")
-        self.assertEqual(report["video_resolution"]["measured"], {"width": 1280, "height": 720})
-        self.assertEqual(len(report["processed_data"]["analytics"]["tracks"]), 1)
-        self.assertEqual(len(report["processed_data"]["video"]["frames_with_annotations"]), 1)
-        self.assertTrue(report["video_resolution"]["matches_metadata"])
+        identity = report["identity_provenance"]
+        processed = report["processed"]
+
+        self.assertEqual(identity["event_id"], "320")
+        self.assertEqual(identity["run"]["run_id"], "test_run")
+        self.assertEqual(processed["video_resolution"]["measured"], {"width": 1280, "height": 720})
+        self.assertEqual(len(processed["analytics"]["tracks"]), 1)
+        self.assertEqual(len(processed["video_annotations"]["frames_with_annotations"]), 1)
+        self.assertTrue(processed["video_resolution"]["matches_metadata"])
 
 
 if __name__ == "__main__":

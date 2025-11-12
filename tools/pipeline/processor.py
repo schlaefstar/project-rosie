@@ -7,6 +7,7 @@ import logging
 import math
 import shutil
 import time
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ import numpy as np
 from .analytics import AnalyticsData, BoundingBox, FrameDetections, TrackSegment, load_analytics
 from .annotations import AnnotationStyle, draw_bbox_annotation, draw_track_annotations, resolve_track_color
 from .events import EventBundle, discover_events
+from .llm import GeminiProvider, LLMClient, LLMError, MediaEvent
 
 LOGGER = logging.getLogger(__name__)
 
@@ -106,11 +108,125 @@ class ProcessedEventResult:
 class EventProcessor:
     """Executes per-event processing into annotated media and metadata."""
 
-    def __init__(self, config: ProcessingConfig) -> None:
+    def __init__(
+        self,
+        config: ProcessingConfig,
+        *,
+        llm_client: LLMClient | None = None,
+        llm_model: str | None = None,
+    ) -> None:
         self.config = config
         self.style = AnnotationStyle()
+        self._llm_client, self._llm_model = self._initialize_llm(llm_client, llm_model)
+        self._llm_provider_name: str | None = None
+        if self._llm_client and self._llm_model:
+            try:
+                provider = self._llm_client.get(self._llm_model)
+                self._llm_provider_name = provider.provider_name
+            except LLMError as exc:
+                LOGGER.warning("LLM model '%s' unavailable: %s. Disabling AI outputs.", self._llm_model, exc)
+                self._llm_client = None
+                self._llm_model = None
+                self._llm_provider_name = None
 
     # Public API ---------------------------------------------------------
+
+    def _initialize_llm(
+        self,
+        llm_client: LLMClient | None,
+        llm_model: str | None,
+    ) -> tuple[LLMClient | None, str | None]:
+        if llm_client:
+            resolved_model = llm_model or os.environ.get("ROSIE_LLM_MODEL")
+            if not resolved_model:
+                LOGGER.warning("LLM client provided without model; AI outputs disabled.")
+                return None, None
+            return llm_client, resolved_model
+
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return None, None
+
+        resolved_model = llm_model or os.environ.get("ROSIE_LLM_MODEL") or "models/gemini-2.0-flash"
+        try:
+            provider = GeminiProvider(api_key=api_key, model_name=resolved_model)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Unable to initialize Gemini provider: %s. AI outputs disabled.", exc)
+            return None, None
+
+        client = LLMClient()
+        client.register(provider)
+        LOGGER.info("LLM provider '%s' initialized with model '%s'.", provider.provider_name, provider.model_name)
+        return client, provider.model_name
+
+    def _generate_ai_outputs(
+        self,
+        bundle: EventBundle,
+        video_path: Path,
+        analytics: AnalyticsData,
+    ) -> Mapping[str, object]:
+        if not self._llm_client or not self._llm_model:
+            return {}
+
+        try:
+            provider = self._llm_client.get(self._llm_model)
+        except LLMError as exc:
+            LOGGER.warning("LLM provider lookup failed: %s", exc)
+            return {}
+
+        frame_samples = self._select_frame_samples(bundle)
+        detector_summary = self._compose_detector_summary(analytics)
+        event = MediaEvent(
+            event_id=bundle.event_id or bundle.key,
+            video_path=video_path,
+            frame_paths=frame_samples,
+            metadata=bundle.metadata or {},
+            detector_summary=detector_summary,
+        )
+
+        try:
+            result = self._llm_client.caption_event(self._llm_model, event)
+        except LLMError as exc:
+            LOGGER.warning("LLM captioning failed for event %s: %s", bundle.key, exc)
+            return {"error": str(exc)}
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.exception("Unexpected LLM failure for event %s", bundle.key)
+            return {"error": str(exc)}
+
+        output: Dict[str, object] = {
+            "provider": provider.provider_name,
+            "model": self._llm_model,
+            "result": result.as_dict(),
+        }
+        response_id = getattr(result.raw_response, "response_id", None)
+        if response_id:
+            output["response_id"] = response_id
+        return output
+
+    def _select_frame_samples(self, bundle: EventBundle) -> Sequence[Path]:
+        frames = bundle.files.get("thumbnails", [])
+        samples: List[Path] = []
+        for path in frames:
+            if path.exists():
+                samples.append(path)
+            if len(samples) >= 3:
+                break
+        return tuple(samples)
+
+    def _compose_detector_summary(self, analytics: AnalyticsData) -> str | None:
+        summary = analytics.summary()
+        parts = [f"{key}={value}" for key, value in summary.items() if value not in (None, "")]
+        labels = sorted({track.label for track in analytics.iter_tracks()})
+        if labels:
+            if len(labels) > 5:
+                display = ", ".join(labels[:5]) + ", ..."
+            else:
+                display = ", ".join(labels)
+            parts.append(f"track_labels={display}")
+        if not parts:
+            return None
+        joined = "; ".join(parts)
+        return joined if len(joined) <= 500 else joined[:497] + "..."
 
     def process_bundle(self, bundle: EventBundle) -> ProcessedEventResult:
         LOGGER.info("Processing event %s", bundle.key)
@@ -145,6 +261,12 @@ class EventProcessor:
                 frame_size=frame_size,
             )
 
+            ai_outputs = self._generate_ai_outputs(
+                bundle=workspace_bundle,
+                video_path=video_path,
+                analytics=analytics_data,
+            )
+
             report = self._build_report(
                 bundle=workspace_bundle,
                 analytics=analytics_data,
@@ -153,6 +275,7 @@ class EventProcessor:
                 frame_count=frame_count,
                 video_summary=video_summary,
                 thumbnail_outputs=thumbnail_outputs,
+                ai_outputs=ai_outputs,
             )
 
             output_dir = self._finalize_outputs(
@@ -567,6 +690,7 @@ class EventProcessor:
         frame_count: int,
         video_summary: List[FrameOutput],
         thumbnail_outputs: List[ThumbnailOutput],
+        ai_outputs: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         width, height = frame_size
         metadata = bundle.metadata or {}
@@ -597,14 +721,20 @@ class EventProcessor:
 
         processed_thumbnails = [thumb.to_serializable() for thumb in thumbnail_outputs]
 
-        json_payload = {
+        identity_provenance = {
             "event_id": bundle.event_id,
             "event_key": bundle.key,
             "run": run_info,
+        }
+
+        input_section = {
             "file_info": {
                 "source_files": sorted(path.name for path in bundle.iter_files()),
             },
             "event_dto": metadata,
+        }
+
+        processed_section = {
             "analytics_summary": analytics_summary,
             "video_resolution": {
                 "measured": measured_resolution,
@@ -612,15 +742,24 @@ class EventProcessor:
                 "analytics": analytics_resolution,
                 "matches_metadata": bool(matches_metadata),
             },
-            "annotated_video_filename": f"{bundle.event_id}_annotated.mp4",
-            "annotated_thumbnails": [thumb.filename for thumb in thumbnail_outputs],
-            "processed_data": {
-                "video": processed_video,
-                "thumbnail_mappings": processed_thumbnails,
-                "analytics": {
-                    "tracks": [track.to_serializable() for track in analytics.iter_tracks()],
-                },
+            "video_annotations": processed_video,
+            "thumbnail_annotations": processed_thumbnails,
+            "analytics": {
+                "tracks": [track.to_serializable() for track in analytics.iter_tracks()],
             },
+        }
+
+        output_files = {
+            "annotated_video": f"{bundle.event_id}_annotated.mp4",
+            "annotated_thumbnails": [thumb.filename for thumb in thumbnail_outputs],
+        }
+
+        json_payload = {
+            "identity_provenance": identity_provenance,
+            "input": input_section,
+            "processed": processed_section,
+            "output_files": output_files,
+            "outputs_ai": ai_outputs or {},
         }
 
         return json_payload

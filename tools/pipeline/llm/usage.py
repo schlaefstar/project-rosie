@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
 
-@dataclass(slots=True)
+@dataclass
 class UsageRecord:
     """Structured record persisted by the usage ledger."""
 

@@ -14,11 +14,14 @@ class LLMClient:
         self._providers: Dict[str, LLMProvider] = {}
 
     def register(self, provider: LLMProvider) -> None:
-        key = provider.model_name.lower()
-        self._providers[key] = provider
+        primary = self._normalize(provider.model_name)
+        self._providers[primary] = provider
+        # Keep a secondary alias without the models/ prefix to match typical CLI usage.
+        alias = self._strip_prefix(primary)
+        self._providers.setdefault(alias, provider)
 
     def get(self, model_name: str) -> LLMProvider:
-        provider = self._providers.get(model_name.lower())
+        provider = self._providers.get(self._normalize(model_name))
         if not provider:
             raise LLMError(f"No provider registered for model '{model_name}'.")
         return provider
@@ -26,6 +29,14 @@ class LLMClient:
     def caption_event(self, model_name: str, event: MediaEvent) -> LLMResult:
         provider = self.get(model_name)
         return provider.caption_event(event)
+
+    @staticmethod
+    def _normalize(model_name: str) -> str:
+        return model_name.strip().lower()
+
+    @staticmethod
+    def _strip_prefix(model_name: str) -> str:
+        return model_name.split("/", 1)[1] if model_name.startswith("models/") else model_name
 
 
 __all__ = ["LLMClient"]

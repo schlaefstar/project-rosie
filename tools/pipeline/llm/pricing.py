@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Mapping, MutableMapping
 
 
-@dataclass(slots=True)
+@dataclass
 class PricingRule:
     """Per-model pricing expressed in USD per million tokens."""
 
@@ -43,7 +43,10 @@ class PricingTable:
 
     @staticmethod
     def _normalize(model_name: str) -> str:
-        return model_name.strip().lower()
+        value = model_name.strip().lower()
+        if value.startswith("models/"):
+            return value.split("/", 1)[1]
+        return value
 
 
 __all__ = ["PricingRule", "PricingTable"]
