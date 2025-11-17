@@ -36,7 +36,9 @@ class LLMClient:
 
     @staticmethod
     def _strip_prefix(model_name: str) -> str:
-        return model_name.split("/", 1)[1] if model_name.startswith("models/") else model_name
+        if "/" in model_name:
+            return model_name.split("/", 1)[-1]
+        return model_name
 
 
 __all__ = ["LLMClient"]

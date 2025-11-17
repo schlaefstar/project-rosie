@@ -29,7 +29,8 @@ _DEFAULT_PROMPT_PATH = _PROJECT_ROOT / "config" / "llm_prompts" / "gemini_captio
 
 def _default_schema() -> str:
     return (
-        '{"summary": str, "classifications": [{"label": str, "confidence": float, "rationale": str}], '
+        '{"steady_state": str, "summary": str, '
+        '"classifications": [{"label": str, "confidence": float, "rationale": str}], '
         '"token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}'
     )
 
@@ -66,6 +67,10 @@ class GeminiProvider(LLMProvider):
         self._generation_config = dict(generation_config)
         self._model = genai.GenerativeModel(self.model_name, generation_config=generation_config)
         self._prompt_template = self._load_prompt_template()
+        if not self._prompt_template:
+            LOGGER.error(
+                "Prompt template for GeminiProvider is empty. Requests will be sent without system context."
+            )
         if self.prompt_builder is None:
             template = self._prompt_template
 
@@ -130,9 +135,15 @@ class GeminiProvider(LLMProvider):
             )
             for item in parsed_json.get("classifications", [])
         ]
+        steady_state = parsed_json.get("steady_state")
+        if isinstance(steady_state, str):
+            steady_state = steady_state.strip() or None
+        else:
+            steady_state = None
 
         result = LLMResult(
             summary=parsed_json.get("summary", "").strip(),
+            steady_state=steady_state,
             classifications=classifications,
             token_usage=token_usage,
             raw_response=response,
@@ -220,21 +231,8 @@ class GeminiProvider(LLMProvider):
             except Exception as exc:  # pragma: no cover - configuration issue
                 LOGGER.warning("Failed to load prompt template from %s: %s", path, exc)
 
-        LOGGER.warning("Using fallback Gemini prompt template.")
-        return (
-            "You are Rosie, a security analyst summarizing short residential camera events.\n"
-            "Describe what happens in at most three sentences.\n"
-            "Be specific about people, packages, vehicles, and notable motion.\n"
-            "If the visuals are unclear, call out the uncertainty explicitly.\n"
-            "Return ONLY valid JSON matching:\n"
-            "[[SCHEMA_JSON]]\n"
-            "Context:\n"
-            "- Event ID: [[EVENT_ID]]\n"
-            "- Detector summary: [[DETECTOR_SUMMARY]]\n"
-            "- Frame samples: [[FRAME_LIST]]\n"
-            "- Metadata snippet: [[METADATA_SNIPPET]]\n"
-            "Do not include Markdown code fences or extra commentary."
-        )
+        LOGGER.error("No prompt template found for GeminiProvider; returning an empty prompt template.")
+        return ""
 
     @staticmethod
     def _normalize_model_name(name: str) -> str:
@@ -280,21 +278,12 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _render_prompt_template(template: str, event: MediaEvent) -> str:
-    if event.metadata:
-        try:
-            metadata_snippet = json.dumps(event.metadata, default=str)[:1000]
-        except Exception:  # pragma: no cover
-            metadata_snippet = str(event.metadata)[:1000]
-    else:
-        metadata_snippet = "None provided."
-
-    detector_summary = event.detector_summary or "None provided."
+    detector_summary = event.detector_summary or "No detections reported."
     frame_list = ", ".join(path.name for path in event.frame_paths) if event.frame_paths else "None provided."
     replacements = {
         "[[EVENT_ID]]": event.event_id or "unknown-event",
         "[[DETECTOR_SUMMARY]]": detector_summary,
         "[[FRAME_LIST]]": frame_list,
-        "[[METADATA_SNIPPET]]": metadata_snippet,
         "[[SCHEMA_JSON]]": _default_schema(),
     }
     rendered = template

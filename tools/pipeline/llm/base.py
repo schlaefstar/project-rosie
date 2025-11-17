@@ -48,6 +48,7 @@ class LLMResult:
     """Standardized return payload from a provider call."""
 
     summary: str
+    steady_state: str | None
     classifications: Sequence[Classification]
     token_usage: TokenUsage
     raw_response: Any = None
@@ -56,6 +57,7 @@ class LLMResult:
     def as_dict(self) -> MutableMapping[str, Any]:
         return {
             "summary": self.summary,
+            "steady_state": self.steady_state,
             "classifications": [classification.as_dict() for classification in self.classifications],
             "token_usage": self.token_usage.as_dict(),
             "cost_usd": self.cost_usd,

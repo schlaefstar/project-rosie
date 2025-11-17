@@ -8,6 +8,7 @@ import math
 import shutil
 import time
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,7 @@ import numpy as np
 from .analytics import AnalyticsData, BoundingBox, FrameDetections, TrackSegment, load_analytics
 from .annotations import AnnotationStyle, draw_bbox_annotation, draw_track_annotations, resolve_track_color
 from .events import EventBundle, discover_events
-from .llm import GeminiProvider, LLMClient, LLMError, MediaEvent, PricingTable
+from .llm import ClipTaggerProvider, GeminiProvider, LLMClient, LLMError, MediaEvent, PricingTable
 from .logging_utils import log_path
 
 LOGGER = logging.getLogger(__name__)
@@ -146,11 +147,8 @@ class EventProcessor:
                 return None, None
             return llm_client, resolved_model
 
-        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            return None, None
-
-        resolved_model = llm_model or os.environ.get("ROSIE_LLM_MODEL") or "models/gemini-2.0-flash"
+        provider_name = (os.environ.get("ROSIE_LLM_PROVIDER") or "").strip().lower()
+        prompt_template_path = os.environ.get("ROSIE_LLM_PROMPT_PATH")
         pricing_path = os.environ.get("ROSIE_LLM_PRICING_PATH")
         pricing = (
             PricingTable.load_from_file(pricing_path)
@@ -158,8 +156,70 @@ class EventProcessor:
             else PricingTable.load_default()
         )
 
+        if provider_name == "cliptagger" or (
+            not provider_name
+            and (
+                os.environ.get("CLIPTAGGER_API_KEY")
+                or os.environ.get("ROSIE_CLIPTAGGER_API_KEY")
+                or os.environ.get("INFERENCE_API_KEY")
+            )
+        ):
+            api_key = (
+                os.environ.get("CLIPTAGGER_API_KEY")
+                or os.environ.get("ROSIE_CLIPTAGGER_API_KEY")
+                or os.environ.get("INFERENCE_API_KEY")
+            )
+            if not api_key:
+                LOGGER.warning("ClipTagger selected but no API key configured; AI outputs disabled.")
+                return None, None
+
+            resolved_model = llm_model or os.environ.get("ROSIE_LLM_MODEL") or "cliptagger-12b"
+            base_url = os.environ.get("CLIPTAGGER_API_BASE_URL", "https://api.inference.net/v1")
+            max_frames_env = os.environ.get("CLIPTAGGER_MAX_FRAMES")
+            try:
+                max_frames = int(max_frames_env) if max_frames_env else None
+            except ValueError:
+                LOGGER.warning("Invalid CLIPTAGGER_MAX_FRAMES value '%s'; ignoring.", max_frames_env)
+                max_frames = None
+
+            try:
+                provider = ClipTaggerProvider(
+                    api_key=api_key,
+                    model_name=resolved_model,
+                    base_url=base_url,
+                    pricing=pricing,
+                    prompt_template_path=Path(prompt_template_path).expanduser()
+                    if prompt_template_path
+                    else None,
+                    max_frames=max_frames,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning("Unable to initialize ClipTagger provider: %s. AI outputs disabled.", exc)
+                return None, None
+
+            client = LLMClient()
+            client.register(provider)
+            LOGGER.info(
+                "LLM provider '%s' initialized with model '%s'.",
+                provider.provider_name,
+                provider.model_name,
+            )
+            return client, provider.model_name
+
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return None, None
+
+        resolved_model = llm_model or os.environ.get("ROSIE_LLM_MODEL") or "models/gemini-2.0-flash"
         try:
-            provider = GeminiProvider(api_key=api_key, model_name=resolved_model, pricing=pricing)
+            provider = GeminiProvider(
+                api_key=api_key,
+                model_name=resolved_model,
+                pricing=pricing,
+                prompt_template_path=Path(prompt_template_path).expanduser()
+                if prompt_template_path
+                else None,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Unable to initialize Gemini provider: %s. AI outputs disabled.", exc)
             return None, None
@@ -198,13 +258,20 @@ class EventProcessor:
         video_path: Path,
         analytics: AnalyticsData,
     ) -> Mapping[str, object]:
+        event_id = bundle.event_id or bundle.key
+        event_logger = self._get_event_logger(event_id)
+
         if not self._llm_client or not self._llm_model:
+            event_logger.info("LLM Input")
+            event_logger.info("  Status: disabled (no provider configured). Skipping AI outputs.")
             return {}
 
         try:
             provider = self._llm_client.get(self._llm_model)
         except LLMError as exc:
             LOGGER.warning("LLM provider lookup failed: %s", exc)
+            event_logger.info("LLM Input")
+            event_logger.info("  Status: provider lookup failed (%s). Skipping AI outputs.", exc)
             return {}
 
         frame_samples = self._select_frame_samples(bundle)
@@ -217,12 +284,11 @@ class EventProcessor:
             detector_summary=detector_summary,
         )
 
-        event_logger = self._get_event_logger(event.event_id or bundle.key)
         event_logger.info("LLM Input")
         event_logger.info("  Model: %s", self._llm_model)
         event_logger.info("  Video: %s", event.video_path)
         event_logger.info("  Frames: %s", ", ".join(path.name for path in event.frame_paths) or "None")
-        event_logger.info("  Detector summary: %s", event.detector_summary or "None")
+        event_logger.info("  Detector hints: %s", event.detector_summary or "None")
         event_logger.info(
             "  Metadata snippet: %s",
             json.dumps(event.metadata, default=str, ensure_ascii=False)[:500] if event.metadata else "None",
@@ -272,6 +338,7 @@ class EventProcessor:
 
         event_logger.info("LLM Output")
         event_logger.info("  Summary: %s", result.summary)
+        event_logger.info("  Steady state: %s", result.steady_state or "None")
         for classification in result.classifications:
             event_logger.info(
                 "  Classification: %s (confidence=%.2f) - %s",
@@ -294,19 +361,43 @@ class EventProcessor:
         return tuple(samples)
 
     def _compose_detector_summary(self, analytics: AnalyticsData) -> str | None:
-        summary = analytics.summary()
-        parts = [f"{key}={value}" for key, value in summary.items() if value not in (None, "")]
-        labels = sorted({track.label for track in analytics.iter_tracks()})
-        if labels:
-            if len(labels) > 5:
-                display = ", ".join(labels[:5]) + ", ..."
-            else:
-                display = ", ".join(labels)
-            parts.append(f"track_labels={display}")
-        if not parts:
+        label_counts: Counter[str] = Counter()
+        label_display: Dict[str, str] = {}
+
+        def _add_label(raw_label: str | None) -> None:
+            if not raw_label:
+                return
+            label = raw_label.strip()
+            if not label:
+                return
+            key = label.lower()
+            label_counts[key] += 1
+            label_display.setdefault(key, label)
+
+        for track in analytics.iter_tracks():
+            _add_label(track.label)
+
+        if not label_counts:
+            for frame in analytics.iter_frames():
+                if not frame.objects:
+                    continue
+                for box in frame.objects:
+                    _add_label(box.label)
+
+        if not label_counts:
             return None
-        joined = "; ".join(parts)
-        return joined if len(joined) <= 500 else joined[:497] + "..."
+
+        items: List[str] = []
+        for key in sorted(label_counts.keys()):
+            display = label_display.get(key, key)
+            count = label_counts[key]
+            if count > 1:
+                items.append(f"{display} ({count})")
+            else:
+                items.append(display)
+
+        summary = ", ".join(items)
+        return summary[:500] if len(summary) > 500 else summary
 
     def process_bundle(self, bundle: EventBundle) -> ProcessedEventResult:
         LOGGER.info("Processing event %s", bundle.key)
