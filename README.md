@@ -30,6 +30,9 @@ python3 tools/process_video_event.py to_process/event123.json processed --run-su
 # Build representative samples grouped by device type
 python3 tools/build_device_samples.py raw_videos by_device_type
 
+# Run Plumerai video intelligence demo on a video file
+python3 tools/run_plumerai_demo.py raw_videos/your_video.mp4
+
 # Shell wrapper for running the full pipeline (edit the script to append --run-suffix agent)
 ./tools/process_all_queued.sh to_process processed
 ```
@@ -50,6 +53,26 @@ The repository includes a placeholder GitHub Actions workflow that runs linting 
 - `output_files`: Final artifact names such as the annotated video and generated thumbnails.
 
 Refer to real artifacts under `processed/<run_id>/<event_id>/` for the complete structure and field-level details.
+
+## Plumerai Video Intelligence Demo
+
+The `tools/run_plumerai_demo.py` script provides an easy way to run the Plumerai video intelligence demo on video files:
+
+```bash
+# Run with auto-detected video dimensions
+python3 tools/run_plumerai_demo.py raw_videos/your_video.mp4
+
+# Run with explicit dimensions
+python3 tools/run_plumerai_demo.py raw_videos/your_video.mp4 --width 1920 --height 1080
+
+# Override demo path or skip dependency fixing
+python3 tools/run_plumerai_demo.py raw_videos/your_video.mp4 --demo-path /custom/path --no-fix-deps
+```
+
+**Configuration:**
+- Demo path is configured in `config/plumerai.json` or via `PLUMERAI_DEMO_PATH` environment variable
+- GStreamer library path defaults to `/opt/homebrew/lib` (configurable via `PLUMERAI_GSTREAMER_LIB_PATH`)
+- The script automatically fixes library rpaths on first run to ensure GStreamer dependencies are found
 
 ## Agent Notes
 
